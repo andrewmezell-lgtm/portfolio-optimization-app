@@ -37,15 +37,28 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 # -----------------------------
 @st.cache_data
 def load_data(tickers, start, end):
-    data = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)
+    data = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=True
+    )
 
     if data.empty:
         return pd.DataFrame()
 
-    # Handle both single-ticker and multi-ticker cases
+    # Multi-ticker case
     if isinstance(data.columns, pd.MultiIndex):
-        prices = data["Close"]
+        if "Close" in data.columns.get_level_values(0):
+            prices = data["Close"]
+        else:
+            return pd.DataFrame()
+
+    # Single-ticker case
     else:
+        if "Close" not in data.columns:
+            return pd.DataFrame()
         prices = data[["Close"]].copy()
         if len(tickers) == 1:
             prices.columns = [tickers[0]]
@@ -71,9 +84,11 @@ def negative_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate):
         return 9999
     return -((port_return - risk_free_rate) / port_vol)
 
-def optimize_portfolio(mean_returns, cov_matrix, risk_free_rate):
-    num_assets = len(mean_returns)
+def portfolio_volatility(weights, mean_returns, cov_matrix):
+    return portfolio_performance(weights, mean_returns, cov_matrix)[1]
 
+def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate):
+    num_assets = len(mean_returns)
     bounds = tuple((0, 1) for _ in range(num_assets))
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1},)
     initial_guess = num_assets * [1 / num_assets]
@@ -82,6 +97,23 @@ def optimize_portfolio(mean_returns, cov_matrix, risk_free_rate):
         negative_sharpe_ratio,
         initial_guess,
         args=(mean_returns, cov_matrix, risk_free_rate),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    return result
+
+def optimize_min_vol(mean_returns, cov_matrix):
+    num_assets = len(mean_returns)
+    bounds = tuple((0, 1) for _ in range(num_assets))
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1},)
+    initial_guess = num_assets * [1 / num_assets]
+
+    result = minimize(
+        portfolio_volatility,
+        initial_guess,
+        args=(mean_returns, cov_matrix),
         method="SLSQP",
         bounds=bounds,
         constraints=constraints
@@ -110,22 +142,38 @@ try:
             # Raw data
             # -----------------------------
             st.subheader("Price Data")
-            st.dataframe(prices.tail())
+            st.dataframe(prices.tail(), use_container_width=True)
 
             st.subheader("Returns")
-            st.dataframe(returns.tail())
+            st.dataframe(returns.tail(), use_container_width=True)
 
             st.subheader("Correlation Matrix")
-            st.dataframe(returns.corr())
+            st.dataframe(returns.corr(), use_container_width=True)
 
             # -----------------------------
             # Optimization
             # -----------------------------
-            result = optimize_portfolio(mean_returns, cov_matrix, risk_free_rate)
+            max_sharpe_result = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate)
+            min_vol_result = optimize_min_vol(mean_returns, cov_matrix)
 
-            weights = result.x
-            ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
-            sharpe = (ret - risk_free_rate) / vol if vol != 0 else np.nan
+            max_sharpe_weights = max_sharpe_result.x
+            min_vol_weights = min_vol_result.x
+
+            max_sharpe_ret, max_sharpe_vol = portfolio_performance(
+                max_sharpe_weights, mean_returns, cov_matrix
+            )
+            min_vol_ret, min_vol_vol = portfolio_performance(
+                min_vol_weights, mean_returns, cov_matrix
+            )
+
+            max_sharpe_ratio = (
+                (max_sharpe_ret - risk_free_rate) / max_sharpe_vol
+                if max_sharpe_vol != 0 else np.nan
+            )
+            min_vol_sharpe = (
+                (min_vol_ret - risk_free_rate) / min_vol_vol
+                if min_vol_vol != 0 else np.nan
+            )
 
             # -----------------------------
             # Optimal weights table
@@ -134,26 +182,29 @@ try:
 
             weights_df = pd.DataFrame({
                 "Asset": prices.columns,
-                "Weight": weights
+                "Max Sharpe Weight": max_sharpe_weights,
+                "Min Vol Weight": min_vol_weights
             })
 
-            st.dataframe(weights_df.style.format({"Weight": "{:.2%}"}))
+            st.dataframe(
+                weights_df.style.format({
+                    "Max Sharpe Weight": "{:.2%}",
+                    "Min Vol Weight": "{:.2%}"
+                }),
+                use_container_width=True
+            )
 
             # -----------------------------
             # Portfolio summary table
             # -----------------------------
             st.subheader("Portfolio Summary")
 
-            summary_df = pd.DataFrame({
-                "Metric": ["Expected Return", "Volatility", "Sharpe Ratio"],
-                "Value": [ret, vol, sharpe]
+            summary_display = pd.DataFrame({
+                "Portfolio": ["Maximum Sharpe", "Minimum Volatility"],
+                "Expected Return": [f"{max_sharpe_ret:.2%}", f"{min_vol_ret:.2%}"],
+                "Volatility": [f"{max_sharpe_vol:.2%}", f"{min_vol_vol:.2%}"],
+                "Sharpe Ratio": [f"{max_sharpe_ratio:.2f}", f"{min_vol_sharpe:.2f}"]
             })
-
-            # Format return and volatility as percentages, Sharpe as decimal
-            summary_display = summary_df.copy()
-            summary_display.loc[summary_display["Metric"] == "Expected Return", "Value"] = f"{ret:.2%}"
-            summary_display.loc[summary_display["Metric"] == "Volatility", "Value"] = f"{vol:.2%}"
-            summary_display.loc[summary_display["Metric"] == "Sharpe Ratio", "Value"] = f"{sharpe:.2f}"
 
             st.dataframe(summary_display, use_container_width=True)
 
@@ -187,11 +238,19 @@ try:
             )
 
             ax.scatter(
-                vol,
-                ret,
+                max_sharpe_vol,
+                max_sharpe_ret,
                 marker="*",
                 s=300,
-                label="Optimal Portfolio"
+                label="Max Sharpe Portfolio"
+            )
+
+            ax.scatter(
+                min_vol_vol,
+                min_vol_ret,
+                marker="X",
+                s=200,
+                label="Min Vol Portfolio"
             )
 
             ax.set_title("Efficient Frontier")
